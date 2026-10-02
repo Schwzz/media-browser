@@ -1,5 +1,6 @@
 {
   "contact": "",
   "gelbooru_user_id": "",
-  "gelbooru_api_key": ""
+  "gelbooru_api_key": "",
+  "max_download_mb": 1
 }

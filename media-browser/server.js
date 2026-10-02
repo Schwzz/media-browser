@@ -219,8 +219,28 @@ const SOURCES = {
   gelbooru: (a, o) => gelbooru(a.q, a.after, a.sort, o),
 };
 
-// Small feed cache (60s) so scrolling back and re-loading is instant and polite to the sites
-const cache = new Map();
+// Small in-memory feed cache so scrolling back and re-loading is instant and polite to the sites.
+// A Map iterates in insertion order, so its first key is always the least recently used one:
+// a read moves the entry to the end, and when the cache is full the first entry is dropped.
+const CACHE_TTL_MS = 60000; // an entry is valid for 60s from when it was stored (reads don't extend it)
+const CACHE_MAX = 100;      // maximum number of entries
+const cache = new Map();    // key -> { t: time stored, v: feed result }
+
+function cacheGet(key) {
+  const hit = cache.get(key);
+  if (!hit) return undefined;
+  if (Date.now() - hit.t >= CACHE_TTL_MS) { cache.delete(key); return undefined; } // expired
+  cache.delete(key); cache.set(key, hit); // mark as most recently used
+  return hit.v;
+}
+
+function cachePut(key, v) {
+  const now = Date.now();
+  cache.delete(key);
+  for (const [k, e] of cache) if (now - e.t >= CACHE_TTL_MS) cache.delete(k); // sweep expired (at most CACHE_MAX entries)
+  if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value);        // still full: drop the LRU entry
+  cache.set(key, { t: now, v });
+}
 
 // ---- HTTP server ----
 const send = (res, code, body, type = 'application/json') => {
@@ -290,15 +310,17 @@ http.createServer(async (req, res) => {
       if (!src) return send(res, 400, { error: 'Unknown source' });
       const k = new URLSearchParams(sp); k.delete('nc');
       const key = k.toString();
-      const hit = cache.get(key);
-      const fresh = sp.get('nc') === '1' || sp.get('sort') === 'random' || sp.get('source') === 'nekos';
-      if (hit && !fresh && Date.now() - hit.t < 60000) return send(res, 200, hit.v);
+      // Random / nekos.best results change on every call, so they are never read from or stored in the cache
+      const volatile = sp.get('sort') === 'random' || sp.get('source') === 'nekos';
+      if (sp.get('nc') !== '1' && !volatile) {
+        const hit = cacheGet(key);
+        if (hit) return send(res, 200, hit);
+      }
       const out = await src(
         { q: sp.get('q'), after: sp.get('after'), sort: sp.get('sort') },
         { type: sp.get('type') || 'all', lim: clamp(sp.get('limit'), 15) }
       );
-      if (cache.size > 100) cache.clear();
-      cache.set(key, { t: Date.now(), v: out });
+      if (!volatile) cachePut(key, out);
       return send(res, 200, out);
     }
     if (u.pathname === '/api/tags') {
