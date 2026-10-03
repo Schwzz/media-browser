@@ -12,6 +12,8 @@
            display:flex; flex-wrap:wrap; gap:8px; padding:10px 12px; align-items:center; }
   input, select, button { background:var(--bg); color:var(--text); border:1px solid var(--line);
            border-radius:8px; padding:8px 10px; font:inherit; }
+  select { color-scheme:dark; } /* dark native dropdown (no white popup frame/gaps) */
+  select option { background:var(--panel); color:var(--text); }
   button { cursor:pointer; }
   button:hover, button.on { border-color:var(--accent); color:var(--accent); }
   :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
@@ -58,15 +60,20 @@
   #toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); z-index:30; background:var(--panel);
            border:1px solid var(--line); padding:8px 14px; border-radius:8px; }
   #priv { position:fixed; inset:0; z-index:20; background:var(--bg); display:flex; align-items:center; justify-content:center; color:var(--line); }
-  #lb { position:fixed; inset:0; z-index:10; background:rgba(8,9,14,.95); display:flex; align-items:center; justify-content:center; }
+  #lb { --bar:56px; --top:8px; position:fixed; inset:0; z-index:10; background:rgba(8,9,14,.95); display:flex; flex-direction:column; align-items:center; justify-content:center; padding-top:var(--top); padding-bottom:var(--bar); }
   #lbm { display:flex; }
-  #lbm img, #lbm video { max-width:92vw; max-height:74vh; object-fit:contain; border-radius:6px; }
+  /* media and tags are centered together above the bottom bar (--bar), so tags never overlap the media;
+     96px = tag strip (72px) + gaps */
+  #lbm img, #lbm video { max-width:92vw; max-height:calc(100vh - var(--bar) - var(--top) - 96px); max-height:calc(100dvh - var(--bar) - var(--top) - 96px); object-fit:contain; border-radius:6px; }
   #lb .nav { position:absolute; top:50%; transform:translateY(-50%); font-size:28px; padding:10px 16px; }
   #lbp { left:12px; } #lbn { right:12px; }
   #lbx { position:absolute; top:12px; right:12px; }
-  #lbtags { position:absolute; left:0; right:0; bottom:56px; display:flex; flex-wrap:wrap; gap:6px; justify-content:center; padding:0 64px; max-height:72px; overflow:auto; }
+  #lbtags { width:100%; margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; justify-content:center; padding:0 64px; max-height:72px; overflow:auto; }
+  #lbtags:empty { display:none; }
   #lbtags button { padding:2px 8px; font-size:12px; color:var(--dim); }
-  #lbbar { position:absolute; left:0; right:0; bottom:0; display:flex; gap:14px; align-items:center; justify-content:center; padding:12px; color:var(--dim); }
+  #lbbar { position:absolute; left:0; right:0; bottom:0; display:flex; flex-wrap:wrap; gap:6px 14px; align-items:center; justify-content:center; padding:12px; color:var(--dim); }
+  #lbt { max-width:60vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  @media (max-width:600px) { #lb { --bar:100px; } }
   #lbbar a { color:var(--text); }
 </style>
 </head>
@@ -145,7 +152,11 @@ const HINTS = {
   nekos: 'category: neko, waifu, kitsune, hug, pat, dance… (empty = neko)',
 };
 const DEF = { source: 'danbooru', q: '', sort: 'latest', type: 'all', rating: 'all', orient: 'all', size: '260', limit: '15', blur: true, auto: true, pins: [] };
-let next = null, loading = false, done = false, empty = 0, type = 'all', pins = new Set();
+let next = null, done = false, empty = 0, type = 'all', pins = new Set();
+// Loading state: ctl = the request in flight (null when idle), gen = which feed we're on (bumped on every
+// new search/source/filter), failed = last request errored, seen/requested = media urls and cursors used so far
+let ctl = null, gen = 0, failed = false, seen = new Set(), requested = new Set();
+const MAX_EMPTY = 3; // auto-load pauses after this many batches in a row that add nothing visible
 
 // ---- menu: controls can be pinned to the top bar ----
 const ctls = [...document.querySelectorAll('.ctl')];
@@ -212,6 +223,29 @@ function applyFilters() {
 
 const px = (u) => '/api/dl?inline=1&url=' + encodeURIComponent(u);
 
+// Source data is untrusted. Elements are built with DOM APIs (never HTML strings) so titles, urls, types and
+// tags stay data. Links from sources must be absolute http(s) URLs; anything else (javascript:, data:, relative
+// paths into this app...) becomes '' and the link is left inert.
+function safeHref(u) {
+  try {
+    const x = new URL(u);
+    return x.protocol === 'http:' || x.protocol === 'https:' ? x.href : '';
+  } catch { return ''; }
+}
+function mediaEl(it) {
+  const mk = (tag, attrs) => { const e = document.createElement(tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+  if (it.type === 'image') return mk('img', { decoding: 'async', loading: 'lazy', src: px(it.thumb || it.url), alt: '' });
+  if (it.type === 'gif' && /\.(mp4|webm)/.test(it.url)) {
+    const v = mk('video', { class: 'gifv', 'data-src': px(it.url), muted: '', loop: '', playsinline: '', preload: 'none' });
+    v.muted = true; // the muted attribute alone only applies to parser-created elements
+    return v;
+  }
+  if (it.type === 'gif') return mk('img', { decoding: 'async', loading: 'lazy', src: px(it.url), alt: '' });
+  const attrs = { src: px(it.url), controls: '', preload: 'none' };
+  if (it.thumb) attrs.poster = px(it.thumb);
+  return mk('video', attrs);
+}
+
 // GIF-style videos only load and play while on screen (keeps the page light)
 const vio = new IntersectionObserver((es) => es.forEach((e) => {
   const v = e.target;
@@ -225,22 +259,15 @@ function card(it) {
   el.dataset.type = it.type; el.dataset.rating = it.rating || 's';
   el.dataset.o = (it.w || 1) >= (it.h || 1) ? 'landscape' : 'portrait';
   el.hidden = !shown(el);
-  let media;
-  if (it.type === 'image') {
-    media = `<img decoding="async" loading="lazy" src="${px(it.thumb || it.url)}" alt="">`;
-  } else if (it.type === 'gif' && /\.(mp4|webm)/.test(it.url)) {
-    media = `<video class="gifv" data-src="${px(it.url)}" muted loop playsinline preload="none"></video>`;
-  } else if (it.type === 'gif') {
-    media = `<img decoding="async" loading="lazy" src="${px(it.url)}" alt="">`;
-  } else {
-    media = `<video src="${px(it.url)}" controls preload="none" ${it.thumb ? `poster="${px(it.thumb)}"` : ''}></video>`;
-  }
-  el.innerHTML = media + `<div class="bar"><span class="kind">${it.type}</span>
-    <a class="src" target="_blank" rel="noopener"></a><button class="view" type="button">View</button><button class="dl" type="button">Save</button></div>`;
+  const bar = document.createElement('div');
+  bar.className = 'bar';
+  bar.innerHTML = '<span class="kind"></span><a class="src" target="_blank" rel="noopener"></a><button class="view" type="button">View</button><button class="dl" type="button">Save</button>'; // static template, no source data
+  bar.querySelector('.kind').textContent = it.type;
+  el.append(mediaEl(it), bar);
   el.querySelectorAll('video.gifv').forEach((v) => vio.observe(v));
-  const a = el.querySelector('.src');
-  a.textContent = it.title; a.href = it.link;
-  Object.assign(el.dataset, { url: it.url, title: it.title, link: it.link, tags: it.tags || '', src: $('#source').value });
+  const a = bar.querySelector('.src'), href = safeHref(it.link);
+  a.textContent = it.title; if (href) a.href = href;
+  Object.assign(el.dataset, { url: it.url, title: it.title, link: href, tags: it.tags || '', src: $('#source').value });
   return el;
 }
 
@@ -269,43 +296,70 @@ $('#saveall').onclick = async () => {
   toast(`Saved ${ok}${bad ? `, ${bad} failed` : ''}`);
 };
 
-async function load(reset) {
-  if (loading || (done && !reset)) return;
-  if (reset) { vio.disconnect(); grid.innerHTML = ''; next = null; done = false; empty = 0; save(); }
-  loading = true; statusEl.textContent = 'Loading…';
+// One feed request at a time. reset = start a new feed (new search/source/filters), which cancels any request
+// still in flight. manual = a deliberate click (Load more / Retry), which gets past the auto-load pause.
+async function load(reset, manual) {
+  if (reset) {
+    gen++; if (ctl) ctl.abort(); ctl = null;
+    vio.disconnect(); grid.innerHTML = '';
+    next = null; done = false; failed = false; empty = 0; seen = new Set(); requested = new Set();
+    save();
+  } else if (ctl || done || (failed && !manual)) return;
+  if (manual && !reset) empty = Math.min(empty, MAX_EMPTY - 1); // one more try; auto-load resumes only if it finds something
+  failed = false;
+  const myGen = gen, cursor = next, c = new AbortController();
+  ctl = c; requested.add(cursor || '');
+  statusEl.textContent = 'Loading…';
   const p = new URLSearchParams({ source: $('#source').value, q: $('#q').value.trim(), sort: $('#sort').value, limit: $('#limit').value });
   if (type !== 'all') p.set('type', type);
-  if (reset) p.set('nc', '1');
-  if (next) p.set('after', next);
+  if (cursor) p.set('after', cursor); else p.set('nc', '1'); // the first page of a feed always skips the cache read
   try {
-    const r = await fetch('/api/feed?' + p);
+    const r = await fetch('/api/feed?' + p, { signal: c.signal });
     const j = await r.json();
     if (j.error) throw new Error(j.error);
-    let visible = 0;
-    j.items.forEach((it) => { const c = card(it); if (!c.hidden) visible++; grid.appendChild(c); });
-    empty = visible ? 0 : empty + 1;
-    next = j.next; done = !next;
+    if (myGen !== gen) return; // a newer search replaced this one: drop the result
+    let added = 0, fresh = 0;
+    for (const it of j.items) {
+      if (!it || typeof it.url !== 'string') continue; // skip malformed entries instead of failing the whole page
+      if (seen.has(it.url)) continue; // the same media is never shown twice in one feed
+      seen.add(it.url); added++;
+      const card_ = card(it); if (!card_.hidden) fresh++; grid.appendChild(card_);
+    }
+    empty = fresh ? 0 : empty + 1;
+    next = j.next || null;
+    // end of results: no next cursor, or a cursor we already used that gave nothing new (a looping source)
+    done = !next || (requested.has(next) && !added);
     statusEl.textContent = done ? (grid.children.length ? 'End of results' : 'Nothing found') : '';
-    if (!done && !$('#auto').checked) {
+    if (!done && (!$('#auto').checked || empty >= MAX_EMPTY)) {
+      if ($('#auto').checked) statusEl.textContent = 'No matches on the last few pages ';
       const b = document.createElement('button');
-      b.textContent = 'Load more'; b.onclick = () => load();
+      b.textContent = 'Load more'; b.onclick = () => load(false, true);
       statusEl.append(b);
     }
-  } catch (e) { statusEl.textContent = 'Error: ' + e.message; done = true; }
-  loading = false;
-  fill();
+  } catch (e) {
+    if (myGen !== gen) return; // aborted because a new search started: nothing to report
+    failed = true; // pause auto-loading, but don't treat it as the end: Retry asks for the same page again
+    statusEl.textContent = 'Error: ' + e.message + ' ';
+    const b = document.createElement('button');
+    b.textContent = 'Retry'; b.onclick = () => load(false, true);
+    statusEl.append(b);
+  } finally {
+    if (myGen === gen) ctl = null;
+  }
+  if (myGen === gen) fill();
 }
 
-// With auto-load on, keep loading while the bottom is in view (stops after 3 loads that show nothing under your filters)
+// With auto-load on, keep loading while the bottom is in view. Scrolling alone never overrides the
+// pause (errors, or MAX_EMPTY batches with nothing visible); Load more / Retry / a filter change do.
 function fill() {
-  if (!$('#auto').checked || done || loading || empty >= 3) return;
+  if (!$('#auto').checked || done || ctl || failed || empty >= MAX_EMPTY) return;
   if (statusEl.getBoundingClientRect().top < innerHeight + 400) load();
 }
 let tick = false;
 addEventListener('scroll', () => {
   if (tick) return;
   tick = true;
-  requestAnimationFrame(() => { tick = false; empty = 0; fill(); });
+  requestAnimationFrame(() => { tick = false; fill(); });
 }, { passive: true });
 
 // ---- tag suggestions ----
@@ -351,12 +405,17 @@ function openViewer(c) {
   cur = c;
   const url = c.dataset.url, full = px(url);
   const vid = /\.(mp4|webm)(\?|$)/.test(url);
-  $('#lbm').innerHTML = vid
-    ? `<video src="${full}" controls autoplay loop ${c.dataset.type === 'gif' ? 'muted' : ''}></video>`
-    : `<img src="${full}" alt="">`;
+  const media = document.createElement(vid ? 'video' : 'img');
+  if (vid) {
+    media.controls = true; media.autoplay = true; media.loop = true;
+    if (c.dataset.type === 'gif') { media.setAttribute('muted', ''); media.muted = true; }
+  } else media.alt = '';
+  media.src = full;
+  $('#lbm').replaceChildren(media);
   $('#lbm').classList.toggle('hid', isHidden(c));
   $('#lbt').textContent = c.dataset.title;
-  $('#lbl').href = c.dataset.link;
+  const lh = safeHref(c.dataset.link);
+  if (lh) $('#lbl').href = lh; else $('#lbl').removeAttribute('href');
   $('#lbd').textContent = c.classList.contains('saved') ? 'Saved ✓' : 'Save';
   $('#lbtags').replaceChildren(...c.dataset.tags.split(' ').filter(Boolean).slice(0, 60).map((t) => {
     const b = document.createElement('button');
@@ -370,7 +429,7 @@ function openViewer(c) {
   if (nx && nx.dataset.type === 'image') new Image().src = px(nx.dataset.url); // preload next
   lb.hidden = false;
   document.body.style.overflow = 'hidden';
-  if (i >= list.length - 3) { empty = 0; load(); }
+  if (i >= list.length - 3 && !failed) { empty = 0; load(); } // stepping through = deliberate, so it may load more
 }
 function step(d) {
   const list = visible(), n = list[list.indexOf(cur) + d];
